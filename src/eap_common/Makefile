@@ -13,6 +13,8 @@ LIB_OBJS= \
 	eap_sake_common.o \
 	eap_sim_common.o \
 	eap_wsc_common.o \
+	eap_did_common.o \
+	eap_did_http.o \
 	ikev2_common.o
 
 include ../lib.rules

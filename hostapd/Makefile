@@ -387,6 +387,13 @@ CFLAGS += -DCONFIG_ERP
 NEED_HMAC_SHA256_KDF=y
 endif
 
+ifdef CONFIG_EAP_DID
+CFLAGS += -DEAP_SERVER_DID
+OBJS += ../src/eap_server/eap_server_did.o ../src/eap_common/eap_did_common.o ../src/eap_common/eap_did_http.o
+CFLAGS += -DCURL_STATICLIB
+LIBS += -lcurl -lz
+endif
+
 ifdef CONFIG_EAP_MD5
 CFLAGS += -DEAP_SERVER_MD5
 OBJS += ../src/eap_server/eap_server_md5.o

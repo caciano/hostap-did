@@ -24,6 +24,7 @@ const char * eap_server_get_name(int vendor, enum eap_type type);
 
 /* EAP server method registration calls for statically linked in methods */
 int eap_server_identity_register(void);
+int eap_server_did_register(void);
 int eap_server_md5_register(void);
 int eap_server_tls_register(void);
 int eap_server_unauth_tls_register(void);

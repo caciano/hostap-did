@@ -29,6 +29,11 @@ int eap_server_register_methods(void)
 		ret = eap_server_identity_register();
 #endif /* EAP_SERVER_IDENTITY */
 
+#ifdef EAP_SERVER_DID
+	if (ret == 0)
+		ret = eap_server_did_register();
+#endif /* EAP_SERVER_DID */
+
 #ifdef EAP_SERVER_MD5
 	if (ret == 0)
 		ret = eap_server_md5_register();

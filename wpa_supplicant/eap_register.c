@@ -25,6 +25,11 @@ int eap_register_methods(void)
 {
 	int ret = 0;
 
+#ifdef EAP_DID
+	if (ret == 0)
+		ret = eap_peer_did_register();
+#endif /* EAP_DID */
+
 #ifdef EAP_MD5
 	if (ret == 0)
 		ret = eap_peer_md5_register();
@@ -166,6 +171,11 @@ int eap_register_methods(void)
 	if (ret == 0)
 		ret = eap_server_tls_register();
 #endif /* EAP_SERVER_TLS */
+
+#ifdef EAP_SERVER_DID
+	if (ret == 0)
+		ret = eap_server_did_register();
+#endif /* EAP_SERVER_DID */
 
 #ifdef EAP_SERVER_UNAUTH_TLS
 	if (ret == 0)

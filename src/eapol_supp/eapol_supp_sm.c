@@ -302,6 +302,7 @@ SM_STATE(SUPP_PAE, AUTHENTICATING)
 	sm->keyRun = false;
 	sm->keyDone = false;
 	sm->suppStart = true;
+	sm->startWhen = 0; /* Stop startWhen timer during authentication. FIXME: Double check if adheres with EAP state machine spec */
 }
 
 
