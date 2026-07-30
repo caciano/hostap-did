@@ -1,3 +1,4 @@
+.config
 *.service
 eapol_test
 nfc_pw_token
