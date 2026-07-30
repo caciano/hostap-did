@@ -1,163 +1,111 @@
 /*
- * EAP-DID common functions shared between server and peer
+ * EAP-DID: Shared routines between server and peer
+ * Copyright (c) 2024-2026, Caciano Machado
  *
- * Key derivation, thid extraction, session ID generation.
- *
- * Issue #16: Transcript hash for key confirmation.
- * Issue #18: AES-GCM VP encryption.
+ * This software may be distributed under the terms of the BSD license.
+ * See README for more details.
  */
 
 #include "includes.h"
+
 #include "common.h"
-#include "eap_common/eap_did_common.h"
-#include "wpabuf.h"
+#include "eap_did_common.h"
 
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 
-/* -----------------------------------------------------------------------
- * Key derivation — HKDF-SHA256 over thid (extract+expand)
- *
- * Extract step uses an empty salt (matching the original implementation).
- * Expand step uses counter-mode HMAC with the given label as info.
- *
- * NOTE: the empty-salt extract should be reviewed in the security
- * audit (issue #13).  It works because thid carries enough entropy
- * for the testbed, but may need strengthening for production.
- * ----------------------------------------------------------------------- */
-
-u8 *eap_did_derive_key(const char *thid, const char *label, size_t out_len)
-{
-	u8 prk[SHA256_DIGEST_LENGTH];
-	u8 *okm;
-	unsigned int md_len = SHA256_DIGEST_LENGTH;
-	u8 counter = 1;
-	size_t done = 0;
-
-	if (!thid || !label || out_len == 0)
-		return NULL;
-
-	/* Extract: PRK = HMAC-SHA256(salt="", IKM=thid) */
-	HMAC(EVP_sha256(), "", 0,
-	     (const unsigned char *)thid, strlen(thid),
-	     prk, &md_len);
-
-	okm = os_malloc(out_len);
-	if (!okm)
-		return NULL;
-
-	/* Expand: RFC 5869 §2.3
-	 * T(0) = empty
-	 * T(N) = HMAC-SHA256(PRK, T(N-1) | info | N)
-	 * OKM = first L octets of T(1) | T(2) | ... | T(N)
-	 */
-	u8 t_prev[SHA256_DIGEST_LENGTH];
-	size_t t_prev_len = 0;
-
-	while (done < out_len) {
-		u8 info_buf[256 + SHA256_DIGEST_LENGTH];
-		u8 hmac_out[SHA256_DIGEST_LENGTH];
-		size_t info_len = 0;
-		size_t copy;
-
-		/* Prepend T(N-1) if available (RFC 5869 chaining) */
-		if (t_prev_len > 0) {
-			os_memcpy(info_buf, t_prev, t_prev_len);
-			info_len = t_prev_len;
-		}
-
-		/* Append label || counter */
-		{
-			size_t label_len = strlen(label);
-			if (info_len + label_len + 1 > sizeof(info_buf)) {
-				os_free(okm);
-				return NULL;
-			}
-			os_memcpy(info_buf + info_len, label, label_len);
-			info_len += label_len;
-			info_buf[info_len++] = counter;
-		}
-
-		HMAC(EVP_sha256(), prk, SHA256_DIGEST_LENGTH,
-		     info_buf, info_len, hmac_out, &md_len);
-
-		/* Save T(N) for next iteration */
-		os_memcpy(t_prev, hmac_out, SHA256_DIGEST_LENGTH);
-		t_prev_len = SHA256_DIGEST_LENGTH;
-
-		copy = (out_len - done < md_len) ? (out_len - done) : md_len;
-		os_memcpy(okm + done, hmac_out, copy);
-		done += copy;
-		counter++;
-	}
-
-	return okm;
-}
-
 
 /*
- * CEK-based key derivation (Issue #27)
+ * HKDF-SHA256 (RFC 5869) with the CEK as input keying material, the thid as
+ * salt and the label as info:
  *
- * Uses CEK from DIDComm JWE (ECDH-ES output) as IKM and thid as salt.
- * The thid is observable on the EAP channel but the CEK never traverses it.
+ *   PRK = HMAC-SHA256(salt = thid, IKM = CEK)                    (extract)
+ *   T(0) = empty string
+ *   T(n) = HMAC-SHA256(PRK, T(n-1) | label | n)                  (expand)
+ *   OKM  = first out_len octets of T(1) | T(2) | ...
  *
- * MSK  = HKDF-SHA256(IKM=CEK, salt=thid, info="EAP-DID-MSK",  L=64)
- * EMSK = HKDF-SHA256(IKM=CEK, salt=thid, info="EAP-DID-EMSK", L=64)
+ * Feeding T(n-1) back in is what makes the blocks a chain rather than
+ * independent PRF outputs, and it is the part section 2.3 of the RFC actually
+ * specifies. Leaving it out still yields a pseudorandom string, so nothing
+ * observable breaks, but the result is not HKDF and does not match any other
+ * implementation.
  */
-u8 *eap_did_derive_key_cek(const u8 *cek, size_t cek_len,
-			   const char *thid, const char *label,
-			   size_t out_len)
+u8 * eap_did_derive_key_cek(const u8 *cek, size_t cek_len, const char *thid,
+			    const char *label, size_t out_len)
 {
 	u8 prk[SHA256_DIGEST_LENGTH];
+	u8 prev[SHA256_DIGEST_LENGTH];
+	size_t prev_len = 0;
 	u8 *okm;
 	unsigned int md_len = SHA256_DIGEST_LENGTH;
 	u8 counter = 1;
-	size_t done = 0;
+	size_t done = 0, label_len;
 
 	if (!cek || cek_len == 0 || !thid || !label || out_len == 0)
 		return NULL;
 
-	/* Extract: PRK = HMAC-SHA256(salt=thid, IKM=CEK) */
-	HMAC(EVP_sha256(), thid, strlen(thid),
-	     cek, cek_len, prk, &md_len);
-
-	okm = os_malloc(out_len);
-	if (!okm)
+	label_len = os_strlen(label);
+	if (label_len == 0 || label_len > 254)
 		return NULL;
 
-	/* Expand: T(n) = HMAC-SHA256(PRK, T(n-1) | info | n) */
+	/* The block counter is a single octet, so at most 255 blocks exist */
+	if (out_len > 255 * SHA256_DIGEST_LENGTH)
+		return NULL;
+
+	if (!HMAC(EVP_sha256(), thid, os_strlen(thid), cek, cek_len, prk,
+		  &md_len))
+		return NULL;
+
+	okm = os_malloc(out_len);
+	if (!okm) {
+		forced_memzero(prk, sizeof(prk));
+		return NULL;
+	}
+
 	while (done < out_len) {
-		u8 info_buf[256];
-		u8 hmac_out[SHA256_DIGEST_LENGTH];
-		size_t info_len;
+		u8 input[SHA256_DIGEST_LENGTH + 255];
+		u8 t[SHA256_DIGEST_LENGTH];
+		size_t input_len = 0;
 		size_t copy;
 
-		info_len = strlen(label);
-		if (info_len > sizeof(info_buf) - 1) {
-			os_free(okm);
+		/* T(n) = HMAC(PRK, T(n-1) | label | n); T(0) is empty */
+		os_memcpy(input, prev, prev_len);
+		input_len = prev_len;
+		os_memcpy(input + input_len, label, label_len);
+		input_len += label_len;
+		input[input_len++] = counter;
+
+		if (!HMAC(EVP_sha256(), prk, SHA256_DIGEST_LENGTH, input,
+			  input_len, t, &md_len)) {
+			forced_memzero(input, sizeof(input));
+			forced_memzero(prev, sizeof(prev));
+			bin_clear_free(okm, out_len);
+			forced_memzero(prk, sizeof(prk));
 			return NULL;
 		}
-		os_memcpy(info_buf, label, info_len);
-		info_buf[info_len++] = counter;
+		forced_memzero(input, sizeof(input));
 
-		HMAC(EVP_sha256(), prk, SHA256_DIGEST_LENGTH,
-		     info_buf, info_len, hmac_out, &md_len);
+		copy = out_len - done < md_len ? out_len - done : md_len;
+		os_memcpy(okm + done, t, copy);
 
-		copy = (out_len - done < md_len) ? (out_len - done) : md_len;
-		os_memcpy(okm + done, hmac_out, copy);
+		/* Carried into the next block, so it outlives t */
+		os_memcpy(prev, t, md_len);
+		prev_len = md_len;
+
+		forced_memzero(t, sizeof(t));
 		done += copy;
 		counter++;
 	}
 
+	forced_memzero(prev, sizeof(prev));
+	forced_memzero(prk, sizeof(prk));
+
 	return okm;
 }
 
-/* -----------------------------------------------------------------------
- * Session ID derivation — type byte || SHA256(thid)
- * ----------------------------------------------------------------------- */
 
-u8 *eap_did_get_session_id(u8 eap_type, const char *thid, size_t *len)
+u8 * eap_did_session_id(u8 eap_type, const char *thid, size_t *len)
 {
 	u8 *sid;
 
@@ -169,135 +117,161 @@ u8 *eap_did_get_session_id(u8 eap_type, const char *thid, size_t *len)
 		return NULL;
 
 	sid[0] = eap_type;
-	SHA256((const unsigned char *)thid, strlen(thid), sid + 1);
+	SHA256((const u8 *) thid, os_strlen(thid), sid + 1);
 	*len = 1 + SHA256_DIGEST_LENGTH;
+
 	return sid;
 }
 
 
-/* -----------------------------------------------------------------------
- * Issue #18: AES-256-GCM encrypt/decrypt for VP protection
- * ----------------------------------------------------------------------- */
-
-int eap_did_aes_gcm_encrypt(const u8 *key, const u8 *iv,
-			    const u8 *plaintext, size_t pt_len,
-			    const u8 *aad, size_t aad_len,
-			    u8 *ct, u8 *tag)
+void eap_did_key_id(const char *did, char *buf, size_t buf_len)
 {
-	EVP_CIPHER_CTX *ctx;
-	int len;
-	int ct_len;
+	const char *pos;
+	int n = 0;
 
-	if (!key || !iv || !plaintext || !ct || !tag)
-		return -1;
+	pos = did ? os_strchr(did, '.') : NULL;
+	while (pos) {
+		const char *next;
 
-	ctx = EVP_CIPHER_CTX_new();
-	if (!ctx)
-		return -1;
-
-	if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
-		goto err;
-
-	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1)
-		goto err;
-
-	if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1)
-		goto err;
-
-	/* Add AAD if provided */
-	if (aad && aad_len > 0) {
-		if (EVP_EncryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1)
-			goto err;
+		pos++;
+		/* Only key segments are numbered; 'S' holds services */
+		if (*pos && os_strchr("AEVID", *pos)) {
+			n++;
+			if (*pos == 'E') {
+				os_snprintf(buf, buf_len, "%s#key-%d", did, n);
+				return;
+			}
+		}
+		next = os_strchr(pos, '.');
+		pos = next;
 	}
 
-	if (EVP_EncryptUpdate(ctx, ct, &len, plaintext, (int)pt_len) != 1)
-		goto err;
-	ct_len = len;
-
-	if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1)
-		goto err;
-	ct_len += len;
-
-	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1)
-		goto err;
-
-	EVP_CIPHER_CTX_free(ctx);
-	(void)ct_len;
-	return 0;
-
-err:
-	EVP_CIPHER_CTX_free(ctx);
-	return -1;
+	wpa_printf(MSG_INFO, "EAP-DID: No key agreement segment in %s",
+		   did ? did : "");
+	os_snprintf(buf, buf_len, "%s#key-1", did ? did : "");
 }
 
-int eap_did_aes_gcm_decrypt(const u8 *key, const u8 *iv,
-			    const u8 *ct, size_t ct_len,
-			    const u8 *aad, size_t aad_len,
-			    const u8 *tag, u8 *pt)
+
+/* Decode base58btc, the multibase encoding used inside did:peer:2 */
+static int did_b58_decode(const char *in, size_t in_len, u8 *out,
+			      size_t *out_len)
 {
-	EVP_CIPHER_CTX *ctx;
-	int len;
-	int pt_len;
+	static const char alphabet[] =
+		"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+	u8 *buf;
+	size_t buf_len, zeros = 0, start, i, j;
 
-	if (!key || !iv || !ct || !tag || !pt)
+	while (zeros < in_len && in[zeros] == '1')
+		zeros++;
+
+	/* log(58) / log(256) is about 0.733 */
+	buf_len = in_len * 733 / 1000 + 1;
+	buf = os_zalloc(buf_len);
+	if (!buf)
 		return -1;
 
-	ctx = EVP_CIPHER_CTX_new();
-	if (!ctx)
-		return -1;
+	for (i = 0; i < in_len; i++) {
+		const char *p = os_strchr(alphabet, in[i]);
+		int carry;
 
-	if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1)
-		goto err;
+		if (!p) {
+			os_free(buf);
+			return -1;
+		}
+		carry = p - alphabet;
 
-	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) != 1)
-		goto err;
+		for (j = buf_len; j > 0; j--) {
+			carry += buf[j - 1] * 58;
+			buf[j - 1] = carry & 0xff;
+			carry >>= 8;
+		}
 
-	if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1)
-		goto err;
-
-	/* Add AAD if provided */
-	if (aad && aad_len > 0) {
-		if (EVP_DecryptUpdate(ctx, NULL, &len, aad, (int)aad_len) != 1)
-			goto err;
+		/*
+		 * buf_len is an upper bound on the decoded length, so a carry
+		 * left over here means the input was longer than the estimate
+		 * and the high octets have been dropped. Silently returning a
+		 * truncated key is worse than failing.
+		 */
+		if (carry) {
+			os_free(buf);
+			return -1;
+		}
 	}
 
-	if (EVP_DecryptUpdate(ctx, pt, &len, ct, (int)ct_len) != 1)
-		goto err;
-	pt_len = len;
+	for (start = 0; start < buf_len && buf[start] == 0; start++)
+		;
 
-	if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, 16,
-				(void *)tag) != 1)
-		goto err;
+	if (zeros + buf_len - start > *out_len) {
+		os_free(buf);
+		return -1;
+	}
 
-	if (EVP_DecryptFinal_ex(ctx, pt + len, &len) != 1)
-		goto err;
-	pt_len += len;
+	os_memset(out, 0, zeros);
+	os_memcpy(out + zeros, buf + start, buf_len - start);
+	*out_len = zeros + buf_len - start;
+	os_free(buf);
 
-	EVP_CIPHER_CTX_free(ctx);
-	(void)pt_len;
 	return 0;
+}
 
-err:
-	EVP_CIPHER_CTX_free(ctx);
+
+/*
+ * Pull the key agreement key out of a did:peer:2. The DID is a sequence of
+ * dot separated segments, each introduced by a purpose code: 'A' assertion,
+ * 'E' key agreement, 'V' verification, 'I' capability invocation, 'D'
+ * capability delegation and 'S' service. The key agreement material sits in
+ * the 'E' segment as multibase base58btc over a multicodec prefixed key.
+ */
+int did_x25519_from_did(const char *did, u8 *pub)
+{
+	const char *pos;
+
+	pos = did ? os_strchr(did, '.') : NULL;
+	if (!pos) {
+		wpa_printf(MSG_INFO, "EAP-DID: No segments in DID '%s'",
+			   did ? did : "");
+		return -1;
+	}
+
+	pos++;
+	while (*pos) {
+		const char *next = os_strchr(pos, '.');
+		size_t seg_len = next ? (size_t) (next - pos) : os_strlen(pos);
+		u8 key[64];
+		size_t key_len = sizeof(key);
+
+		if (seg_len < 2 || pos[0] != 'E' || pos[1] != 'z') {
+			if (!next)
+				break;
+			pos = next + 1;
+			continue;
+		}
+
+		if (did_b58_decode(pos + 2, seg_len - 2, key,
+				       &key_len) < 0 || key_len != 34) {
+			wpa_printf(MSG_INFO,
+				   "EAP-DID: Could not decode key agreement segment");
+			return -1;
+		}
+
+		/*
+		 * Only X25519. An Ed25519 key here used to be converted
+		 * birationally, which took a signing key from an identifier
+		 * the peer supplies and made an encryption key out of it.
+		 */
+		if (key[0] != 0xec || key[1] != 0x01) {
+			wpa_printf(MSG_INFO,
+				   "EAP-DID: Unsupported key agreement multicodec %02x%02x",
+				   key[0], key[1]);
+			return -1;
+		}
+
+		os_memcpy(pub, key + 2, 32);
+
+		return 0;
+	}
+
+	wpa_printf(MSG_INFO, "EAP-DID: No key agreement segment in DID");
+
 	return -1;
-}
-
-/* -----------------------------------------------------------------------
- * Convenience wrappers for key derivation
- * ----------------------------------------------------------------------- */
-
-u8 *eap_did_get_msk(const char *thid, size_t *len)
-{
-	if (!thid || !len)
-		return NULL;
-	*len = 64;
-	return eap_did_derive_key(thid, "EAP-DID-MSK", 64);
-}
-
-u8 *eap_did_get_emsk(const char *thid, size_t *len)
-{
-	if (!thid || !len)
-		return NULL;
-	*len = 64;
-	return eap_did_derive_key(thid, "EAP-DID-EMSK", 64);
 }

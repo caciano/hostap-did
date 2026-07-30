@@ -26,9 +26,8 @@
 #endif /* EAP_SERVER_SIM || EAP_SERVER_AKA */
 
 
-#ifdef EAP_SIM_DB
-static int hostapd_sim_db_cb_sta(struct hostapd_data *hapd,
-				 struct sta_info *sta, void *ctx)
+static int hostapd_eap_pending_cb_sta(struct hostapd_data *hapd,
+				      struct sta_info *sta, void *ctx)
 {
 	if (eapol_auth_eap_pending_cb(sta->eapol_sm, ctx) == 0)
 		return 1;
@@ -36,16 +35,23 @@ static int hostapd_sim_db_cb_sta(struct hostapd_data *hapd,
 }
 
 
-static void hostapd_sim_db_cb(void *ctx, void *session_ctx)
+/*
+ * A method that returned without deciding calls this once its answer is in.
+ * @session_ctx is the struct eap_sm the method was called with, which is what
+ * both the EAPOL and the RADIUS session lookups match on. EAP-SIM/AKA reach it
+ * through eap_sim_db; anything else reaches it through eap_config::pending_cb.
+ */
+static void hostapd_eap_pending_cb(void *ctx, void *session_ctx)
 {
 	struct hostapd_data *hapd = ctx;
-	if (ap_for_each_sta(hapd, hostapd_sim_db_cb_sta, session_ctx) == 0) {
+
+	if (ap_for_each_sta(hapd, hostapd_eap_pending_cb_sta,
+			    session_ctx) == 0) {
 #ifdef RADIUS_SERVER
 		radius_server_eap_pending_cb(hapd->radius_srv, session_ctx);
 #endif /* RADIUS_SERVER */
 	}
 }
-#endif /* EAP_SIM_DB */
 
 
 #ifdef RADIUS_SERVER
@@ -205,6 +211,8 @@ static struct eap_config * authsrv_eap_config(struct hostapd_data *hapd)
 	cfg->ssl_ctx = hapd->ssl_ctx;
 	cfg->msg_ctx = hapd->msg_ctx;
 	cfg->eap_sim_db_priv = hapd->eap_sim_db_priv;
+	cfg->pending_cb = hostapd_eap_pending_cb;
+	cfg->pending_cb_ctx = hapd;
 	cfg->tls_session_lifetime = hapd->conf->tls_session_lifetime;
 	cfg->tls_flags = hapd->conf->tls_flags;
 	cfg->max_auth_rounds = hapd->conf->max_auth_rounds;
@@ -369,7 +377,7 @@ int authsrv_init(struct hostapd_data *hapd)
 		hapd->eap_sim_db_priv =
 			eap_sim_db_init(hapd->conf->eap_sim_db,
 					hapd->conf->eap_sim_db_timeout,
-					hostapd_sim_db_cb, hapd);
+					hostapd_eap_pending_cb, hapd);
 		if (hapd->eap_sim_db_priv == NULL) {
 			wpa_printf(MSG_ERROR, "Failed to initialize EAP-SIM "
 				   "database interface");

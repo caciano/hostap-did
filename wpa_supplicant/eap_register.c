@@ -6,6 +6,13 @@
  * See README for more details.
  */
 
+/*
+ * EAP-DID: Decentralized Identifier authentication method for WiFi 802.1X
+ * Modified from hostap_2_11 (BSD-3-Clause) by SWARM project (UFSC/UFRGS)
+ * Copyright (c) 2024-2026 Caciano Machado
+ * See NOTICE in swarm repository for full attribution.
+ */
+
 #include "includes.h"
 
 #include "common.h"

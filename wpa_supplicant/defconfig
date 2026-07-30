@@ -105,6 +105,9 @@ CONFIG_EAP_TLS=y
 # enabled in network configuration)
 #CONFIG_EAP_TLSV1_3=y
 
+# EAP-DID. Requires libcurl and zlib, so it is not enabled by default.
+#CONFIG_EAP_DID=y
+
 # EAL-PEAP
 CONFIG_EAP_PEAP=y
 

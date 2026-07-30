@@ -389,9 +389,13 @@ endif
 
 ifdef CONFIG_EAP_DID
 CFLAGS += -DEAP_SERVER_DID
-OBJS += ../src/eap_server/eap_server_did.o ../src/eap_common/eap_did_common.o ../src/eap_common/eap_did_http.o
-CFLAGS += -DCURL_STATICLIB
-LIBS += -lcurl -lz
+OBJS += ../src/eap_server/eap_server_did.o
+OBJS += ../src/eap_common/eap_did_async.o
+OBJS += ../src/eap_common/eap_did_common.o
+OBJS += ../src/eap_common/eap_did_http.o
+OBJS += ../src/eap_common/eap_did_jwe.o
+OBJS += ../src/eap_common/eap_did_vp.o
+LIBS += -lcurl -lz -lcrypto -lpthread
 endif
 
 ifdef CONFIG_EAP_MD5

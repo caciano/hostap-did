@@ -1,6 +1,11 @@
 LIB_OBJS= \
 	chap.o \
 	eap_common.o \
+	eap_did_async.o \
+	eap_did_common.o \
+	eap_did_http.o \
+	eap_did_jwe.o \
+	eap_did_vp.o \
 	eap_eke_common.o \
 	eap_eke_common.o \
 	eap_fast_common.o \
@@ -13,8 +18,6 @@ LIB_OBJS= \
 	eap_sake_common.o \
 	eap_sim_common.o \
 	eap_wsc_common.o \
-	eap_did_common.o \
-	eap_did_http.o \
 	ikev2_common.o
 
 include ../lib.rules

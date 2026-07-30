@@ -1,121 +1,129 @@
 /*
- * EAP-DID HTTP Client Wrapper (libcurl)
+ * EAP-DID: Blocking HTTP client and payload helpers
+ * Copyright (c) 2024-2026, Caciano Machado
  *
- * Provides simple blocking HTTP GET/POST/PATCH for talking directly
- * to Identus Cloud Agent REST APIs from C code.
- *
- * Used in branch did2 to replace the Python proxy layer.
+ * This software may be distributed under the terms of the BSD license.
+ * See README for more details.
  */
 
 #ifndef EAP_DID_HTTP_H
 #define EAP_DID_HTTP_H
 
-#include <stddef.h>
-#include <stdint.h>
-
-/*
- * HTTP response container.  Caller owns body and must free with
- * did_http_response_free().
+/**
+ * struct did_http_response - Result of an HTTP request
+ * @status: HTTP status code, or 0 on a transport error
+ * @body: Response body, NUL terminated; freed with did_http_response_free()
+ * @body_len: Length of @body excluding the terminator
  */
 struct did_http_response {
-	int status;		/* HTTP status code (0 on transport error) */
-	char *body;		/* allocated response body (null-terminated) */
-	size_t body_len;	/* body length excluding null terminator */
+	int status;
+	char *body;
+	size_t body_len;
 };
 
-/*
- * Global init/cleanup for libcurl.  Call did_http_init() once at
- * startup (e.g. from eap_server_did_register or peer init).
+/**
+ * did_http_init - Initialize the HTTP backend
+ * Returns: 0 on success, -1 on failure
+ *
+ * Must be called once before any request, e.g. from method registration.
  */
 int did_http_init(void);
+
+/**
+ * did_http_cleanup - Release resources allocated by did_http_init()
+ */
 void did_http_cleanup(void);
 
-/*
- * Blocking HTTP GET.
- *   url       : full URL (e.g. "http://caddy-verifier:8082/cloud-agent/...")
- *   resp      : response struct (caller frees with did_http_response_free)
- *   timeout_s : timeout in seconds
- * Returns 0 on success (HTTP transport ok, resp.status populated),
- *        -1 on transport error (resp.status == 0).
+/**
+ * did_http_get - Perform a blocking HTTP GET
+ * @url: Request URL
+ * @resp: Buffer for the response; released with did_http_response_free()
+ * @timeout_s: Request timeout in seconds
+ * Returns: 0 when the exchange completed and @resp->status is valid, -1 on a
+ * transport error
  */
-int did_http_get(const char *url,
-		 struct did_http_response *resp,
+int did_http_get(const char *url, struct did_http_response *resp,
 		 int timeout_s);
 
-/*
- * Blocking HTTP GET with extra headers.
- *   headers: NULL-terminated array of "Key: Value" strings, or NULL.
+/**
+ * did_http_post - Perform a blocking HTTP POST
+ * @url: Request URL
+ * @content_type: Value for the Content-Type header, or %NULL
+ * @body: Request body, or %NULL for an empty body
+ * @body_len: Length of @body
+ * @resp: Buffer for the response; released with did_http_response_free()
+ * @timeout_s: Request timeout in seconds
+ * Returns: 0 when the exchange completed and @resp->status is valid, -1 on a
+ * transport error
  */
-int did_http_get_hdr(const char *url,
-		     const char **headers,
-		     struct did_http_response *resp,
-		     int timeout_s);
-
-/*
- * Blocking HTTP POST with optional body.
- *   url         : full URL
- *   content_type: Content-Type header (e.g. "application/json")
- *   body        : request body (may be NULL for empty body)
- *   body_len    : body length
- *   resp        : response struct
- *   timeout_s   : timeout in seconds
- */
-int did_http_post(const char *url,
-		  const char *content_type,
-		  const uint8_t *body, size_t body_len,
-		  struct did_http_response *resp,
+int did_http_post(const char *url, const char *content_type, const u8 *body,
+		  size_t body_len, struct did_http_response *resp,
 		  int timeout_s);
 
-/*
- * Blocking HTTP PATCH with optional body.  Same semantics as POST.
- */
-int did_http_patch(const char *url,
-		   const char *content_type,
-		   const uint8_t *body, size_t body_len,
-		   struct did_http_response *resp,
-		   int timeout_s);
-
-/*
- * Free memory allocated in a did_http_response.
- * Safe to call on a zeroed struct.
+/**
+ * did_http_response_free - Release a response body
+ * @resp: Response to clear; may already be zeroed
  */
 void did_http_response_free(struct did_http_response *resp);
 
-/*
- * Extract a string field from a JSON blob using simple key matching.
- * Returns 0 on success (buf populated, null-terminated), -1 if not found.
- * Caller provides buffer; buf_size includes space for null terminator.
- * Only handles flat string values: "key":"value" or "key": "value".
+/**
+ * did_json_extract_str - Read a string member out of a JSON document
+ * @json: JSON text, not necessarily NUL terminated
+ * @json_len: Length of @json
+ * @key: Member name to look for
+ * @buf: Buffer for the NUL terminated value
+ * @buf_size: Size of @buf including the terminator
+ * Returns: 0 when the member was found and @buf was filled in, -1 otherwise
+ *
+ * This only understands "key":"value" pairs, which is all the Identus Cloud
+ * Agent responses consumed here require. The name is matched only where a
+ * string stands in member name position, so an occurrence inside another
+ * member's value is not a match, but the match is not confined to one nesting
+ * level. A value that does not fit @buf is an error, not a truncation.
+ *
+ * Where a document holds several records that carry the same member names, use
+ * did_json_next_object() to bound the record first.
  */
-int did_json_extract_str(const char *json, size_t json_len,
-			 const char *key,
+int did_json_extract_str(const char *json, size_t json_len, const char *key,
 			 char *buf, size_t buf_size);
 
-/*
- * Extract the _oob query parameter value from a URL string.
- * Returns 0 on success, -1 if not found.
+/**
+ * did_json_next_object - Bound the next JSON object in a buffer
+ * @pos: Where to start looking
+ * @end: End of the buffer
+ * @obj_end: Set to just past the closing brace
+ * Returns: The opening brace of the object, or %NULL when there is no complete
+ * object left
+ *
+ * Braces inside string values are not counted. Starting again from @obj_end
+ * walks the elements of an array of objects in order, which is what reading one
+ * record out of a list of them requires.
  */
-int did_extract_oob_from_url(const char *url,
-			     char *buf, size_t buf_size);
+const char * did_json_next_object(const char *pos, const char *end,
+				  const char **obj_end);
 
-/*
- * gzip-compress a buffer using zlib.
- * Returns 0 on success.  Caller must free *out.
+/**
+ * did_gzip_compress - Deflate a buffer
+ * @in: Input data
+ * @in_len: Length of @in
+ * @out: Buffer for the allocated result; caller frees with os_free()
+ * @out_len: Buffer for the length of the result
+ * Returns: 0 on success, -1 on failure
  */
-int did_gzip_compress(const uint8_t *in, size_t in_len,
-		      uint8_t **out, size_t *out_len);
+int did_gzip_compress(const u8 *in, size_t in_len, u8 **out, size_t *out_len);
 
-/*
- * gzip-decompress a buffer using zlib.
- * Returns 0 on success.  Caller must free *out.
+/**
+ * did_gzip_decompress - Inflate a buffer produced by did_gzip_compress()
+ * @in: Compressed data
+ * @in_len: Length of @in
+ * @out: Buffer for the allocated result; caller frees with os_free()
+ * @out_len: Buffer for the length of the result
+ * Returns: 0 on success, -1 on failure
+ *
+ * The output is capped at %DID_GZIP_MAX_OUTPUT so that a hostile peer cannot
+ * force unbounded allocation.
  */
-int did_gzip_decompress(const uint8_t *in, size_t in_len,
-			uint8_t **out, size_t *out_len);
-
-/*
- * URL-encode a string for use in query parameters (F-28).
- * Returns 0 on success, -1 if buf too small.
- */
-int did_url_encode(const char *in, char *buf, size_t buf_size);
+int did_gzip_decompress(const u8 *in, size_t in_len, u8 **out,
+			size_t *out_len);
 
 #endif /* EAP_DID_HTTP_H */

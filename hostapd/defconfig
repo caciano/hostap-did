@@ -62,6 +62,10 @@ CONFIG_EAP_MD5=y
 # EAP-TLS for the integrated EAP server
 CONFIG_EAP_TLS=y
 
+# EAP-DID for the integrated EAP server. Requires libcurl and zlib to reach
+# the Identus verifier, so it is not enabled by default.
+#CONFIG_EAP_DID=y
+
 # EAP-MSCHAPv2 for the integrated EAP server
 CONFIG_EAP_MSCHAPV2=y
 

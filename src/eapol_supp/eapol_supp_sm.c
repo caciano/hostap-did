@@ -2130,11 +2130,11 @@ struct eapol_sm *eapol_sm_init(struct eapol_ctx *ctx)
 
 	/* Supplicant PAE state machine */
 	sm->heldPeriod = 60;
-	sm->startPeriod = 30;
+	sm->startPeriod = 120;
 	sm->maxStart = 3;
 
 	/* Supplicant Backend state machine */
-	sm->authPeriod = 30;
+	sm->authPeriod = 120;
 
 	os_memset(&conf, 0, sizeof(conf));
 #ifndef CONFIG_OPENSC_ENGINE_PATH

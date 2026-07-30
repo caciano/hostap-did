@@ -3,7 +3,7 @@ ALL=test-base64 test-md4 test-milenage \
 	test-sha1 \
 	test-https test-https_server \
 	test-sha256 test-aes test-x509v3 test-list test-rc4 \
-	test-bss
+	test-bss test-eap-did
 
 include ../src/build.rules
 
@@ -149,6 +149,7 @@ run-tests: $(ALL)
 	./test-sha1
 	./test-sha256
 	./test-bss
+	./test-eap-did
 	@echo
 	@echo All tests completed successfully.
 
@@ -156,3 +157,18 @@ clean: common-clean
 	rm -f *~
 	rm -f test_x509v3_nist.out.*
 	rm -f test_x509v3_nist2.out.*
+# EAP-DID unit tests (did5)
+#
+# The objects are built here from the sources, as test-bss does. Naming the
+# ones hostapd leaves in build/ makes the result depend on whether hostapd
+# happens to have been built, and lets the tests pass against code that is no
+# longer in the tree.
+EAP_DID_OBJS = $(SRC)/eap_common/eap_did_common.o
+EAP_DID_OBJS += $(SRC)/eap_common/eap_did_http.o
+EAP_DID_OBJS += $(SRC)/eap_common/eap_did_jwe.o
+
+_OBJS_VAR := EAP_DID_OBJS
+include ../src/objs.mk
+
+test-eap-did: $(call BUILDOBJ,eap_did_test.o) $(EAP_DID_OBJS) $(LIBS)
+	$(LDO) $(LDFLAGS) -o $@ $^ $(LLIBS) -lcrypto -lz -lcurl -lpthread

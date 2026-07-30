@@ -605,14 +605,19 @@ CONFIG_IEEE8021X_EAPOL=y
 endif
 
 ifdef CONFIG_EAP_DID
+# EAP-DID
 ifeq ($(CONFIG_EAP_DID), dyn)
 CFLAGS += -DEAP_DID_DYNAMIC
 EAPDYN += eap_did.so
 else
-OBJS += ../src/eap_peer/eap_did.o ../src/eap_common/eap_did_common.o ../src/eap_common/eap_did_http.o
 CFLAGS += -DEAP_DID
-CFLAGS += -DCURL_STATICLIB
-LIBS += -lcurl -lz -lmicrohttpd -lpthread
+OBJS += ../src/eap_peer/eap_did.o
+OBJS += ../src/eap_common/eap_did_async.o
+OBJS += ../src/eap_common/eap_did_common.o
+OBJS += ../src/eap_common/eap_did_http.o
+OBJS += ../src/eap_common/eap_did_jwe.o
+OBJS += ../src/eap_common/eap_did_vp.o
+LIBS += -lcurl -lz -lcrypto -lpthread
 endif
 CONFIG_IEEE8021X_EAPOL=y
 endif

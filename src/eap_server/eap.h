@@ -125,6 +125,20 @@ struct eap_config {
 	 */
 	void *eap_sim_db_priv;
 
+	/**
+	 * pending_cb - Report that a method's pending operation has finished
+	 * @ctx: pending_cb_ctx
+	 * @session_ctx: The struct eap_sm the method was called with
+	 *
+	 * A method that returns without deciding, having set method_pending to
+	 * METHOD_PENDING_WAIT, calls this once its answer is in. It is what
+	 * eap_sim_db does through its own callback; this is the same thing
+	 * without a database in the way, for methods that wait on something
+	 * else. May be %NULL, in which case a method must not wait.
+	 */
+	void (*pending_cb)(void *ctx, void *session_ctx);
+	void *pending_cb_ctx;
+
 	struct crypto_rsa_key *imsi_privacy_key;
 
 	bool backend_auth;

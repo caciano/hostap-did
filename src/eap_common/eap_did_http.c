@@ -1,356 +1,398 @@
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE
-#endif
 /*
- * EAP-DID HTTP Client Wrapper — implementation (libcurl + zlib)
+ * EAP-DID: Blocking HTTP client and payload helpers
+ * Copyright (c) 2024-2026, Caciano Machado
  *
- * Branch did2: eliminates Python proxies by making HTTP calls
- * directly from the hostapd/wpa_supplicant C code.
+ * This software may be distributed under the terms of the BSD license.
+ * See README for more details.
  */
 
 #include "includes.h"
+
+#include <curl/curl.h>
+#include <zlib.h>
+
 #include "common.h"
 #include "eap_did_http.h"
 
-#include <curl/curl.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <zlib.h>
-#define DID_GZIP_MAX_OUTPUT  (10 * 1024 * 1024)  /* F-27: 10 MB cap */
+/* Upper bound on inflated output, to bound the cost of a hostile payload */
+#define DID_GZIP_MAX_OUTPUT (10 * 1024 * 1024)
 
-/* ------------------------------------------------------------------- *
- * curl write callback — append to our growing buffer
- * ------------------------------------------------------------------- */
-static size_t write_cb(char *ptr, size_t size, size_t nmemb, void *ud)
+#define DID_HTTP_CONNECT_TIMEOUT 10L
+
+
+static size_t did_http_write_cb(char *ptr, size_t size, size_t nmemb,
+				void *ctx)
 {
-	struct did_http_response *resp = ud;
-	size_t total = size * nmemb;
-	char *newbody = realloc(resp->body, resp->body_len + total + 1);
-	if (!newbody)
-		return 0; /* signal error to curl */
-	resp->body = newbody;
-	memcpy(resp->body + resp->body_len, ptr, total);
-	resp->body_len += total;
+	struct did_http_response *resp = ctx;
+	size_t len = size * nmemb;
+	char *body;
+
+	body = os_realloc(resp->body, resp->body_len + len + 1);
+	if (!body)
+		return 0; /* tells curl to abort the transfer */
+
+	resp->body = body;
+	os_memcpy(resp->body + resp->body_len, ptr, len);
+	resp->body_len += len;
 	resp->body[resp->body_len] = '\0';
-	return total;
+
+	return len;
 }
 
-/* ------------------------------------------------------------------- *
- * Generic request helper
- * ------------------------------------------------------------------- */
-static int do_request_hdr(const char *url, const char *method,
-			const char *content_type,
-			const uint8_t *body, size_t body_len,
-			const char **extra_headers,
-			struct did_http_response *resp,
-			int timeout_s)
+
+/*
+ * Peer certificate validation is off by default because the testbed fronts
+ * the Cloud Agents with self-signed certificates. Set DID_TLS_VERIFY=1 (and
+ * optionally DID_CA_BUNDLE) to enable it.
+ */
+static void did_http_set_tls_opts(CURL *curl, const char *url)
+{
+	const char *ca_bundle, *tls_verify;
+
+	if (os_strncmp(url, "https://", 8) != 0)
+		return;
+
+	ca_bundle = getenv("DID_CA_BUNDLE");
+	tls_verify = getenv("DID_TLS_VERIFY");
+
+	if (tls_verify && atoi(tls_verify) != 0) {
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+		if (ca_bundle)
+			curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
+		return;
+	}
+
+	wpa_printf(MSG_WARNING,
+		   "EAP-DID: TLS verification disabled for %s", url);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+}
+
+
+static int did_http_request(const char *url, int post,
+			    const char *content_type, const u8 *body,
+			    size_t body_len, struct did_http_response *resp,
+			    int timeout_s)
 {
 	CURL *curl;
 	struct curl_slist *hdrs = NULL;
-	CURLcode rc;
+	CURLcode res;
 
-	memset(resp, 0, sizeof(*resp));
+	os_memset(resp, 0, sizeof(*resp));
 
 	curl = curl_easy_init();
 	if (!curl)
 		return -1;
 
 	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout_s);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_cb);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long) timeout_s);
+	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
+			 DID_HTTP_CONNECT_TIMEOUT);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, did_http_write_cb);
 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, resp);
 	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	/* TLS verification configurable via env vars.
-	 * DID_TLS_VERIFY=1 enables; DID_CA_BUNDLE sets CA path.
-	 * Default: disabled for testbed (self-signed Caddy). */
-	{
-		const char *ca_bundle = getenv("DID_CA_BUNDLE");
-		const char *tls_verify = getenv("DID_TLS_VERIFY");
-		int is_https = (strncmp(url, "https://", 8) == 0);
+	did_http_set_tls_opts(curl, url);
 
-		if (is_https && tls_verify && atoi(tls_verify) != 0) {
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-			if (ca_bundle)
-				curl_easy_setopt(curl, CURLOPT_CAINFO, ca_bundle);
-		} else {
-			if (is_https)
-				wpa_printf(MSG_WARNING, "EAP-DID: TLS verification disabled for %s", url);
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-			curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-		}
-	}
-
-	if (strcmp(method, "POST") == 0) {
+	if (post) {
 		curl_easy_setopt(curl, CURLOPT_POST, 1L);
 		if (body && body_len > 0) {
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
-		}
-	} else if (strcmp(method, "PATCH") == 0) {
-		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-		if (body && body_len > 0) {
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body_len);
+			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE,
+					 (long) body_len);
 		}
 	}
 
 	if (content_type) {
-		char ct_header[256];
-		snprintf(ct_header, sizeof(ct_header), "Content-Type: %s", content_type);
-		hdrs = curl_slist_append(hdrs, ct_header);
+		char hdr[256];
+
+		os_snprintf(hdr, sizeof(hdr), "Content-Type: %s",
+			    content_type);
+		hdrs = curl_slist_append(hdrs, hdr);
+		if (hdrs)
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
 	}
 
-	/* Extra custom headers (Issue #27: X-EAP-KeyMaterial) */
-	if (extra_headers) {
-		int i;
-		for (i = 0; extra_headers[i]; i++)
-			hdrs = curl_slist_append(hdrs, extra_headers[i]);
-	}
-	if (hdrs)
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
-
-	rc = curl_easy_perform(curl);
-
-	if (rc == CURLE_OK) {
+	res = curl_easy_perform(curl);
+	if (res == CURLE_OK) {
 		long code = 0;
+
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-		resp->status = (int)code;
-	} else {
-		/* transport error */
-		resp->status = 0;
+		resp->status = (int) code;
 	}
 
 	if (hdrs)
 		curl_slist_free_all(hdrs);
 	curl_easy_cleanup(curl);
 
-	return (rc == CURLE_OK) ? 0 : -1;
+	return res == CURLE_OK ? 0 : -1;
 }
 
-/* ------------------------------------------------------------------- *
- * Public API
- * ------------------------------------------------------------------- */
 
 int did_http_init(void)
 {
-	curl_global_init(CURL_GLOBAL_DEFAULT);
+	if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
+		wpa_printf(MSG_ERROR, "EAP-DID: curl_global_init failed");
+		return -1;
+	}
+
 	return 0;
 }
+
 
 void did_http_cleanup(void)
 {
 	curl_global_cleanup();
 }
 
-int did_http_get(const char *url, struct did_http_response *resp, int timeout_s)
-{
-	return do_request_hdr(url, "GET", NULL, NULL, 0, NULL, resp, timeout_s);
-}
 
-int did_http_get_hdr(const char *url,
-		     const char **headers,
-		     struct did_http_response *resp,
-		     int timeout_s)
+int did_http_get(const char *url, struct did_http_response *resp,
+		 int timeout_s)
 {
-	return do_request_hdr(url, "GET", NULL, NULL, 0, headers, resp, timeout_s);
-}
-
-int did_http_post(const char *url,
-		  const char *content_type,
-		  const uint8_t *body, size_t body_len,
-		  struct did_http_response *resp, int timeout_s)
-{
-	return do_request_hdr(url, "POST", content_type, body, body_len, NULL,
-			  resp, timeout_s);
-}
-
-int did_http_patch(const char *url,
-		   const char *content_type,
-		   const uint8_t *body, size_t body_len,
-		   struct did_http_response *resp, int timeout_s)
-{
-	return do_request_hdr(url, "PATCH", content_type, body, body_len, NULL,
-			  resp, timeout_s);
+	return did_http_request(url, 0, NULL, NULL, 0, resp, timeout_s);
 }
 
 
-/* F-28: Simple URL-encode for query parameter values */
-int did_url_encode(const char *in, char *buf, size_t buf_size)
+int did_http_post(const char *url, const char *content_type, const u8 *body,
+		  size_t body_len, struct did_http_response *resp,
+		  int timeout_s)
 {
-	size_t pos = 0;
-
-	if (!in || !buf || buf_size == 0)
-		return -1;
-
-	while (*in && pos < buf_size - 4) {
-		char c = *in;
-		if ((c >= 'A' && c <= 'Z') ||
-		    (c >= 'a' && c <= 'z') ||
-		    (c >= '0' && c <= '9') ||
-		    c == '-' || c == '_' || c == '.' || c == '~') {
-			buf[pos++] = c;
-		} else {
-			pos += (size_t)snprintf(buf + pos, buf_size - pos,
-						"%%%02X", (unsigned char)c);
-		}
-		in++;
-	}
-	if (*in) /* input too long */
-		return -1;
-	buf[pos] = '\0';
-	return 0;
+	return did_http_request(url, 1, content_type, body, body_len, resp,
+				timeout_s);
 }
+
 
 void did_http_response_free(struct did_http_response *resp)
 {
 	if (!resp)
 		return;
-	free(resp->body);
+
+	os_free(resp->body);
 	resp->body = NULL;
 	resp->body_len = 0;
 	resp->status = 0;
 }
 
-/* ------------------------------------------------------------------- *
- * Minimal JSON helpers — good enough for known Identus responses
- * ------------------------------------------------------------------- */
 
-int did_json_extract_str(const char *json, size_t json_len,
-			 const char *key,
-			 char *buf, size_t buf_size)
+/*
+ * Consume the string token at @pos, which must be its opening quote, and
+ * report the octets between the quotes. Returns the position just past the
+ * closing quote, or NULL if the string does not terminate before @end.
+ * Escapes are not interpreted: the callers read base64url and identifiers,
+ * where an escape is a malformed value rather than a value to be decoded.
+ */
+static const char * did_json_string(const char *pos, const char *end,
+				    const char **val, size_t *val_len)
 {
-	/* Search for "key" : "value" */
-	char pattern[256];
-	snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+	const char *start = ++pos;
 
-	const char *search_end = json + json_len;
-	const char *p = json;
+	while (pos < end && *pos != '"') {
+		if (*pos == '\\' && pos + 1 < end)
+			pos++;
+		pos++;
+	}
 
-	while (p < search_end) {
-		const char *found = memmem(p, search_end - p,
-					   pattern, strlen(pattern));
-		if (!found)
-			return -1;
+	if (pos >= end)
+		return NULL;
 
-		/* Move past the key */
-		const char *cursor = found + strlen(pattern);
+	*val = start;
+	*val_len = pos - start;
 
-		/* Skip whitespace and colon */
-		while (cursor < search_end && (*cursor == ' ' || *cursor == '\t' ||
-					       *cursor == ':' || *cursor == '\n' ||
-					       *cursor == '\r'))
-			cursor++;
+	return pos + 1;
+}
 
-		if (cursor >= search_end)
-			return -1;
 
-		if (*cursor == '"') {
-			/* String value */
-			cursor++; /* skip opening quote */
-			const char *start = cursor;
-			while (cursor < search_end && *cursor != '"') {
-				if (*cursor == '\\' && cursor + 1 < search_end)
-					cursor++; /* skip escaped char */
-				cursor++;
-			}
-			size_t val_len = cursor - start;
-			if (val_len >= buf_size) {
-				wpa_printf(MSG_WARNING,
-					   "EAP-DID: JSON key '%s' value truncated (%zu -> %zu bytes)",
-					   key, val_len, buf_size - 1);
-				val_len = buf_size - 1;
-			}
-			memcpy(buf, start, val_len);
-			buf[val_len] = '\0';
-			return 0;
+static bool did_json_ws(char c)
+{
+	return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+
+const char * did_json_next_object(const char *pos, const char *end,
+				  const char **obj_end)
+{
+	const char *start = NULL;
+	int depth = 0;
+
+	if (!pos || !end || !obj_end)
+		return NULL;
+
+	while (pos < end) {
+		if (*pos == '"') {
+			const char *val;
+			size_t val_len;
+
+			pos = did_json_string(pos, end, &val, &val_len);
+			if (!pos)
+				return NULL;
+			continue;
 		}
 
-		/* Not a string value after this key — try next occurrence */
-		p = found + 1;
+		if (*pos == '{') {
+			if (!depth)
+				start = pos;
+			depth++;
+		} else if (*pos == '}') {
+			depth--;
+			if (depth < 0)
+				return NULL;
+			if (!depth) {
+				*obj_end = pos + 1;
+				return start;
+			}
+		}
+
+		pos++;
+	}
+
+	return NULL;
+}
+
+
+/*
+ * Read the value of member @key. The buffer is walked as a token stream and
+ * @key is matched only where a string stands in member name position, so an
+ * occurrence of the name inside some other member's value is not a match. The
+ * match is not confined to one nesting level: several callers read a member of
+ * an object nested in what they pass. Truncation is an error, not a warning —
+ * a prefix of a DID is a different DID.
+ */
+int did_json_extract_str(const char *json, size_t json_len, const char *key,
+			 char *buf, size_t buf_size)
+{
+	const char *end, *pos;
+	size_t key_len;
+
+	if (!json || !key || !buf || buf_size == 0)
+		return -1;
+
+	end = json + json_len;
+	pos = json;
+	key_len = os_strlen(key);
+
+	while (pos < end) {
+		const char *name, *val;
+		size_t name_len, val_len;
+
+		if (*pos != '"') {
+			pos++;
+			continue;
+		}
+
+		pos = did_json_string(pos, end, &name, &name_len);
+		if (!pos)
+			return -1;
+
+		while (pos < end && did_json_ws(*pos))
+			pos++;
+
+		/* A string not followed by a colon is a value, not a name */
+		if (pos >= end || *pos != ':')
+			continue;
+
+		pos++;
+		while (pos < end && did_json_ws(*pos))
+			pos++;
+
+		if (pos >= end)
+			return -1;
+
+		if (*pos != '"') {
+			/* Not a string value; keep looking */
+			continue;
+		}
+
+		if (name_len != key_len ||
+		    os_memcmp(name, key, key_len) != 0) {
+			pos = did_json_string(pos, end, &val, &val_len);
+			if (!pos)
+				return -1;
+			continue;
+		}
+
+		if (!did_json_string(pos, end, &val, &val_len))
+			return -1;
+
+		if (val_len >= buf_size) {
+			wpa_printf(MSG_INFO,
+				   "EAP-DID: JSON value for '%s' does not fit (%zu octets, buffer %zu)",
+				   key, val_len, buf_size);
+			return -1;
+		}
+
+		os_memcpy(buf, val, val_len);
+		buf[val_len] = '\0';
+
+		return 0;
 	}
 
 	return -1;
 }
 
-int did_extract_oob_from_url(const char *url,
-			     char *buf, size_t buf_size)
-{
-	const char *p = strstr(url, "_oob=");
-	if (!p)
-		return -1;
-	p += 5; /* skip "_oob=" */
 
-	/* Value runs until & or end of string */
-	const char *end = strchr(p, '&');
-	if (!end)
-		end = p + strlen(p);
-
-	size_t val_len = end - p;
-	if (val_len >= buf_size)
-		val_len = buf_size - 1;
-	memcpy(buf, p, val_len);
-	buf[val_len] = '\0';
-	return 0;
-}
-
-/* ------------------------------------------------------------------- *
- * gzip helpers
- * ------------------------------------------------------------------- */
-
-int did_gzip_compress(const uint8_t *in, size_t in_len,
-		      uint8_t **out, size_t *out_len)
+int did_gzip_compress(const u8 *in, size_t in_len, u8 **out, size_t *out_len)
 {
 	uLongf bound = compressBound(in_len);
-	uint8_t *buf = malloc(bound);
+	u8 *buf;
+
+	buf = os_malloc(bound);
 	if (!buf)
 		return -1;
 
 	if (compress2(buf, &bound, in, in_len, Z_BEST_COMPRESSION) != Z_OK) {
-		free(buf);
+		os_free(buf);
 		return -1;
 	}
+
 	*out = buf;
-	*out_len = (size_t)bound;
+	*out_len = bound;
+
 	return 0;
 }
 
-int did_gzip_decompress(const uint8_t *in, size_t in_len,
-			uint8_t **out, size_t *out_len)
-{
-	/* Start with 4x the compressed size, grow if needed */
-	uLongf out_size = in_len * 8;
-	if (out_size < 4096)
-		out_size = 4096;
 
-	uint8_t *buf = malloc(out_size);
+int did_gzip_decompress(const u8 *in, size_t in_len, u8 **out,
+			size_t *out_len)
+{
+	uLongf size = in_len * 8;
+	u8 *buf;
+	int res;
+
+	if (size < 4096)
+		size = 4096;
+
+	buf = os_malloc(size);
 	if (!buf)
 		return -1;
 
-	int rc;
-	while ((rc = uncompress(buf, &out_size, in, in_len)) == Z_BUF_ERROR) {
-		uLongf new_size = out_size * 2;
-		if (new_size > DID_GZIP_MAX_OUTPUT) {  /* F-27: zip bomb protection */
-			free(buf);
+	while ((res = uncompress(buf, &size, in, in_len)) == Z_BUF_ERROR) {
+		uLongf grown = size * 2;
+		u8 *tmp;
+
+		if (grown > DID_GZIP_MAX_OUTPUT) {
+			wpa_printf(MSG_INFO,
+				   "EAP-DID: inflated payload exceeds %d octets",
+				   DID_GZIP_MAX_OUTPUT);
+			os_free(buf);
 			return -1;
 		}
-		uint8_t *new_buf = realloc(buf, new_size);
-		if (!new_buf) {
-			free(buf);
+
+		tmp = os_realloc(buf, grown);
+		if (!tmp) {
+			os_free(buf);
 			return -1;
 		}
-		buf = new_buf;
-		out_size = new_size;
+		buf = tmp;
+		size = grown;
 	}
 
-	if (rc != Z_OK) {
-		free(buf);
+	if (res != Z_OK) {
+		os_free(buf);
 		return -1;
 	}
 
 	*out = buf;
-	*out_len = (size_t)out_size;
+	*out_len = size;
+
 	return 0;
 }

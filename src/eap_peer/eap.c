@@ -32,6 +32,14 @@
 #define STATE_MACHINE_DATA struct eap_sm
 #define STATE_MACHINE_DEBUG_PREFIX "EAP"
 
+/*
+ * Upstream values. Commit 97b618ed0 raised these to 100000 and 50000 to make an
+ * end-to-end run pass, which removed the defence the short counter exists for:
+ * it counts requests under 20 octets, and an EAP-DID keepalive is exactly that,
+ * so a rogue authenticator could hold a supplicant for 50000 rounds and be
+ * answered every time. The server side was left at the upstream defaults, so
+ * the asymmetry was not deliberate either.
+ */
 #define EAP_MAX_AUTH_ROUNDS 100
 #define EAP_MAX_AUTH_ROUNDS_SHORT 50
 #define EAP_CLIENT_TIMEOUT_DEFAULT 60
